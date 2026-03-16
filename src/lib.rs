@@ -179,7 +179,7 @@ fn filter_by_permission(
                 {
                     let _ = log::log(
                         "warn",
-                        &format!(
+                        format!(
                             "Stripped prompt-mutating fields from capsule {:?} \
                              (missing allow_prompt_injection capability)",
                             s.source_id
@@ -336,17 +336,17 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
 
     // Cache capability results per-UUID to avoid redundant host function calls.
     // Multiple hook responses can come from the same capsule.
-    let mut cache = std::collections::HashMap::<&str, bool>::new();
+    let mut cache = std::collections::HashMap::<String, bool>::new();
     filter_by_permission(sourced_responses, |source_id| {
         let Some(uuid) = source_id else {
             return false;
         };
-        *cache.entry(uuid).or_insert_with(|| {
+        *cache.entry(uuid.to_owned()).or_insert_with(|| {
             capabilities::check(uuid, "allow_prompt_injection")
                 .inspect_err(|e| {
                     let _ = log::log(
                         "warn",
-                        &format!("capability check failed for {uuid}: {e}, denying"),
+                        format!("capability check failed for {uuid}: {e}, denying"),
                     );
                 })
                 .unwrap_or(false)
