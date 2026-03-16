@@ -267,10 +267,7 @@ struct MergedPrompt {
 /// a dedicated response topic for plugin contributions. Returns all collected
 /// responses within the timeout window, filtered by permission gating.
 fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<HookResponse> {
-    let response_topic = format!(
-        "prompt_builder.v1.hook_response.{}",
-        request.request_id
-    );
+    let response_topic = format!("prompt_builder.v1.hook_response.{}", request.request_id);
 
     // Subscribe BEFORE publishing to avoid missing fast responses.
     let sub = match ipc::subscribe(&response_topic) {
@@ -281,7 +278,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
                 format!("Failed to subscribe to hook response topic: {e}"),
             );
             return Vec::new();
-        },
+        }
     };
 
     let payload = BeforePromptBuildPayload {
@@ -304,8 +301,8 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
 
     // Block-wait for hook responses within the configured timeout.
     let mut sourced_responses = Vec::new();
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(config.hook_timeout_ms);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(config.hook_timeout_ms);
 
     while std::time::Instant::now() < deadline && sourced_responses.len() < MAX_HOOK_RESPONSES {
         let remaining_ms = deadline
@@ -321,7 +318,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
                 if let Some(new_responses) = parse_hook_responses(&bytes) {
                     sourced_responses.extend(new_responses);
                 }
-            },
+            }
             _ => break,
         }
     }
@@ -367,7 +364,7 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<SourcedHookResponse>> {
                 format!("failed to deserialize hook response envelope: {e}"),
             );
             return None;
-        },
+        }
     };
 
     let messages = envelope.get("messages")?.as_array()?;
@@ -429,23 +426,18 @@ fn fire_after_prompt_build(system_prompt: &str, user_context_prefix: &str, reque
 /// Handle a single `prompt_builder.v1.assemble` request.
 fn handle_assemble(payload: &serde_json::Value, config: &Config) {
     // Extract from Custom payload envelope or direct.
-    let request_value = payload
-        .get("data")
-        .unwrap_or(payload);
+    let request_value = payload.get("data").unwrap_or(payload);
 
     let request: AssembleRequest = match serde_json::from_value(request_value.clone()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = log::log(
-                "error",
-                format!("Failed to parse assemble request: {e}"),
-            );
+            let _ = log::log("error", format!("Failed to parse assemble request: {e}"));
             let _ = ipc::publish_json(
                 "prompt_builder.v1.response.assemble",
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
             );
             return;
-        },
+        }
     };
 
     if request.request_id.is_empty() {
@@ -473,7 +465,11 @@ fn handle_assemble(payload: &serde_json::Value, config: &Config) {
     let _ = ipc::publish_json("prompt_builder.v1.response.assemble", &response);
 
     // Fire after_prompt_build notification (fire-and-forget).
-    fire_after_prompt_build(&merged.system_prompt, &merged.user_context_prefix, &request.request_id);
+    fire_after_prompt_build(
+        &merged.system_prompt,
+        &merged.user_context_prefix,
+        &request.request_id,
+    );
 }
 
 /// Returns `true` if the topic should be dispatched (not a self-echo).
@@ -538,8 +534,8 @@ impl PromptBuilder {
         let config = Config::load();
         let _ = log::info(format!("Hook timeout: {}ms", config.hook_timeout_ms));
 
-        let sub = ipc::subscribe("prompt_builder.v1.*")
-            .map_err(|e| SysError::ApiError(e.to_string()))?;
+        let sub =
+            ipc::subscribe("prompt_builder.v1.*").map_err(|e| SysError::ApiError(e.to_string()))?;
 
         // Also subscribe to our own hook topics so we can filter them out.
         let hook_sub = ipc::subscribe("prompt_builder.v1.hook.before_build")
@@ -560,7 +556,7 @@ impl PromptBuilder {
                     if !bytes.is_empty() {
                         handle_poll_envelope(&bytes, &config);
                     }
-                },
+                }
                 Err(_) => break,
             }
 

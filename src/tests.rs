@@ -279,7 +279,10 @@ fn parse_hook_responses_from_ipc_envelope() {
     );
 
     // Third: nested in Custom `data` envelope
-    assert_eq!(sourced[2].source_id.as_deref(), Some("plugin-custom-prompt"));
+    assert_eq!(
+        sourced[2].source_id.as_deref(),
+        Some("plugin-custom-prompt")
+    );
     assert_eq!(
         sourced[2].response.system_prompt.as_deref(),
         Some("You are a custom assistant.")
@@ -335,14 +338,8 @@ fn filter_passes_all_with_permission() {
         filtered[0].prepend_system_context.as_deref(),
         Some("Context")
     );
-    assert_eq!(
-        filtered[1].append_system_context.as_deref(),
-        Some("Suffix")
-    );
-    assert_eq!(
-        filtered[1].prepend_context.as_deref(),
-        Some("User ctx")
-    );
+    assert_eq!(filtered[1].append_system_context.as_deref(), Some("Suffix"));
+    assert_eq!(filtered[1].prepend_context.as_deref(), Some("User ctx"));
 }
 
 #[test]
@@ -452,7 +449,9 @@ fn should_dispatch_assemble_topic() {
 
 #[test]
 fn should_not_dispatch_own_response_topics() {
-    assert!(!should_dispatch_topic("prompt_builder.v1.response.assemble"));
+    assert!(!should_dispatch_topic(
+        "prompt_builder.v1.response.assemble"
+    ));
     assert!(!should_dispatch_topic("prompt_builder.v1.response.foo"));
 }
 
@@ -468,7 +467,9 @@ fn should_not_dispatch_hook_response_topics() {
 
 #[test]
 fn should_not_dispatch_interceptor_topics() {
-    assert!(!should_dispatch_topic("prompt_builder.v1.hook.before_build"));
+    assert!(!should_dispatch_topic(
+        "prompt_builder.v1.hook.before_build"
+    ));
     assert!(!should_dispatch_topic("prompt_builder.v1.hook.after_build"));
 }
 
@@ -524,8 +525,7 @@ fn before_prompt_build_payload_round_trips() {
         response_topic: "prompt_builder.v1.hook_response.req-123".to_string(),
     };
     let bytes = serde_json::to_vec(&original).expect("serialize");
-    let restored: BeforePromptBuildPayload =
-        serde_json::from_slice(&bytes).expect("deserialize");
+    let restored: BeforePromptBuildPayload = serde_json::from_slice(&bytes).expect("deserialize");
     assert_eq!(restored.request_id, "req-123");
     assert_eq!(restored.system_prompt, "You are helpful.");
     assert_eq!(restored.model, "claude-sonnet-4-20250514");
