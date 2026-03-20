@@ -9,6 +9,9 @@ astrid-version = ">=0.1.0"
 id = "prompt-builder"
 file = "astrid_capsule_prompt_builder.wasm"
 
+[dependencies]
+provides = ["rfc:prompt-assembly.v1"]
+
 [capabilities]
 ipc_publish = [
     "prompt_builder.v1.response.*",
