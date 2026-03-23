@@ -437,18 +437,15 @@ const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
 
-/// Collect tool schemas from all tool-providing capsules via IPC broadcast.
-///
-/// Checks `__tool_schema_cache` in KV first. On cache miss, broadcasts a
-/// `tool.v1.request.describe` request and collects responses from all capsules
-/// that export tool definitions. Results are deduplicated by tool name,
-/// cached in KV, and returned.
 /// Collect tool schemas from all capsules via `trigger_hook`.
 ///
-/// Uses the kernel's `trigger_hook` host function to fan out to all capsules
-/// with `tool.v1.request.describe` interceptors. This works for both WASM
-/// and MCP capsules — the kernel handles the dispatch, each capsule returns
-/// its tool schemas. Results are cached in KV for subsequent calls.
+/// Checks `__tool_schema_cache` in KV first. On cache miss, it uses the
+/// kernel's `trigger_hook` host function to fan out a `tool.v1.request.describe`
+/// request to all capsules with matching interceptors. This works for both WASM
+/// and MCP capsules.
+///
+/// The collected tool schemas are deduplicated by name and cached in KV for
+/// subsequent calls.
 fn collect_tool_schemas() -> Vec<serde_json::Value> {
     // Check KV cache first.
     if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
@@ -590,7 +587,7 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
             }
         };
 
-        // Navigate the IPC drain envelope: envelope.messages[0].payload.data.messages
+        // Navigate the IPC drain envelope: envelope.messages[*].payload.data.messages
         let ipc_messages = match envelope.get("messages").and_then(|m| m.as_array()) {
             Some(arr) => arr,
             None => return Vec::new(),
@@ -599,9 +596,7 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
         if ipc_messages.is_empty() {
             let _ = log::log(
                 "warn",
-                format!(
-                    "Session capsule timed out - no response within {SESSION_FETCH_TIMEOUT_MS}ms"
-                ),
+                "Session capsule responded but the message list was empty.",
             );
             return Vec::new();
         }
