@@ -597,18 +597,18 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
             return Vec::new();
         }
 
-        // The topic is scoped to this request, so iterate to find the first
-        // message with a Custom payload (payload.data).
+        // The topic is scoped to this request. The host strips the
+        // `IpcPayload::Custom { data }` wrapper in `to_guest_bytes` —
+        // the message payload IS the response data, not a `{ "data": ... }`
+        // wrapper. The `unwrap_or` keeps the older wrapped shape working
+        // too (matches `request_value` resolution above).
         for msg in &poll_result.messages {
             let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            let data = match payload.get("data") {
-                Some(d) => d,
-                None => continue,
-            };
+            let data = payload.get("data").unwrap_or(&payload);
 
             if let Some(messages) = data.get("messages") {
                 match serde_json::from_value::<Vec<serde_json::Value>>(messages.clone()) {
