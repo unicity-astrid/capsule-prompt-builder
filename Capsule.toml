@@ -14,18 +14,22 @@ prompt = "1.0.0"
 
 [[topic]]
 name = "prompt_builder.v1.response.assemble"
+direction = "publish"
 description = "Assembled prompt result returned to the react loop"
 
 [[topic]]
 name = "prompt_builder.v1.hook.before_build"
+direction = "publish"
 description = "Interceptor hook fired before prompt assembly for plugin contributions"
 
 [[topic]]
 name = "prompt_builder.v1.hook.after_build"
+direction = "publish"
 description = "Notification fired after prompt assembly completes (fire-and-forget)"
 
 [[topic]]
 name = "session.v1.request.get_messages"
+direction = "publish"
 description = "Request to session capsule for conversation history"
 
 [capabilities]
