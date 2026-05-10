@@ -13,14 +13,14 @@ file = "astrid_capsule_prompt_builder.wasm"
 "astrid:prompt" = "1.0.0"
 
 [publish]
-"prompt_builder.v1.response.*" = { wit = "TODO" }
-"prompt_builder.v1.hook.before_build" = { wit = "TODO" }
-"prompt_builder.v1.hook.after_build" = { wit = "TODO" }
-"session.v1.request.get_messages" = { wit = "TODO" }
+"prompt_builder.v1.response.*" = { wit = "@unicity-astrid/wit/prompt/assemble-response" }
+"prompt_builder.v1.hook.before_build" = { wit = "@unicity-astrid/wit/prompt/before-build-hook" }
+"prompt_builder.v1.hook.after_build" = { wit = "@unicity-astrid/wit/prompt/after-build-event" }
+"session.v1.request.get_messages" = { wit = "@unicity-astrid/wit/session/get-messages-request" }
 
 [subscribe]
-"prompt_builder.v1.*" = { wit = "TODO" }
-"prompt_builder.v1.hook.before_build" = { wit = "TODO" }
-"prompt_builder.v1.hook.after_build" = { wit = "TODO" }
-"prompt_builder.v1.hook_response.*" = { wit = "TODO" }
-"session.v1.response.get_messages.*" = { wit = "TODO" }
+"prompt_builder.v1.*" = { wit = "TODO" }                     # wildcard spans assemble-request and hook events — multiple WIT records, leave unresolved
+"prompt_builder.v1.hook.before_build" = { wit = "@unicity-astrid/wit/prompt/before-build-hook" }
+"prompt_builder.v1.hook.after_build" = { wit = "@unicity-astrid/wit/prompt/after-build-event" }
+"prompt_builder.v1.hook_response.*" = { wit = "@unicity-astrid/wit/prompt/before-build-hook-response" }
+"session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
