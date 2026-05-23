@@ -299,14 +299,19 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
     }
 
     // Block-wait for hook responses within the configured timeout.
+    // `std::time::Instant::now()` panics on `wasm32-unknown-unknown`
+    // (the Astrid-canonical capsule target); track the deadline as a
+    // host-monotonic instant via `astrid_sdk::time::monotonic`, which
+    // routes through `astrid:sys.clock-monotonic-ns`.
     let mut sourced_responses = Vec::new();
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(config.hook_timeout_ms);
+    let start = astrid_sdk::time::monotonic();
+    let timeout_dur = std::time::Duration::from_millis(config.hook_timeout_ms);
 
-    while std::time::Instant::now() < deadline && sourced_responses.len() < MAX_HOOK_RESPONSES {
-        let remaining_ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis();
+    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
+        && sourced_responses.len() < MAX_HOOK_RESPONSES
+    {
+        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
+        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
         if remaining_ms == 0 {
             break;
         }
@@ -510,15 +515,18 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         return Vec::new();
     }
 
-    // Collect responses until we time out or hit the cap.
+    // Collect responses until we time out or hit the cap. Monotonic
+    // clock via `astrid_sdk::time` — `std::time::Instant::now()`
+    // panics on `wasm32-unknown-unknown`.
     let mut all_tools: Vec<serde_json::Value> = Vec::new();
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
+    let start = astrid_sdk::time::monotonic();
+    let timeout_dur = std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
 
-    while std::time::Instant::now() < deadline && all_tools.len() < MAX_TOOL_DESCRIBE_RESPONSES {
-        let remaining_ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis();
+    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
+        && all_tools.len() < MAX_TOOL_DESCRIBE_RESPONSES
+    {
+        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
+        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
         if remaining_ms == 0 {
             break;
         }
