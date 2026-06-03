@@ -147,6 +147,23 @@ const DEFAULT_HOOK_POLL_TIMEOUT_MS: u64 = 2000;
 /// Maximum number of hook responses to collect before proceeding.
 const MAX_HOOK_RESPONSES: usize = 50;
 
+/// First-response window (ms): how long to wait for the FIRST hook
+/// response before concluding no plugin is going to reply. Hook
+/// responders are local pooled capsules that reply within a few bus
+/// hops (~1ms), so the old behaviour of waiting the full
+/// `hook_timeout_ms` (2s) for a first response was a pure per-prompt
+/// floor — and the COMMON case is zero responders (no plugin injects
+/// for a given prompt), which always hit that full backstop. Capping
+/// the first-response wait un-floors throughput under the Store pool
+/// (astrid#816: was pool_size / 2s). `hook_timeout_ms` is retained as
+/// the OUTER cap for the multi-responder accumulation case.
+const HOOK_FIRST_RESPONSE_MS: u64 = 250;
+
+/// Idle-grace window (ms) for the hook fan-out once at least one
+/// response has arrived: poll only this long for stragglers and return
+/// as soon as responders go quiet, instead of waiting the full window.
+const HOOK_IDLE_GRACE_MS: u64 = 100;
+
 /// A hook response paired with its source capsule identifier.
 ///
 /// Used for permission gating: plugins with `allowPromptInjection: false`
@@ -315,7 +332,16 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         if remaining_ms == 0 {
             break;
         }
-        let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+        let remaining = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+        // Full remaining window while waiting for the FIRST response (the
+        // no-responder backstop); a short idle-grace once we have one, so
+        // the loop returns shortly after responders fall quiet instead of
+        // burning the whole window. See HOOK_IDLE_GRACE_MS.
+        let timeout = if sourced_responses.is_empty() {
+            HOOK_FIRST_RESPONSE_MS.min(remaining)
+        } else {
+            HOOK_IDLE_GRACE_MS.min(remaining)
+        };
 
         match sub.recv(timeout) {
             Ok(result) => {
