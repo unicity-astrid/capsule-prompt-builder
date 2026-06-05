@@ -27,20 +27,43 @@ use serde::{Deserialize, Serialize};
 
 /// Runtime configuration loaded from capsule config at startup.
 struct Config {
-    /// Maximum time (in milliseconds) to wait for plugin hook responses.
+    /// Maximum time (in milliseconds) to wait for plugin hook responses — the
+    /// OUTER cap for the multi-responder accumulation case.
     hook_timeout_ms: u64,
+    /// First-response window (ms): how long to wait for the FIRST hook response
+    /// before concluding no plugin will reply. Defaults to
+    /// [`HOOK_FIRST_RESPONSE_MS`]; an operator with a genuinely slow plugin can
+    /// raise it (per principal) instead of having it silently excluded.
+    hook_first_response_ms: u64,
+    /// Idle-grace window (ms) once at least one response has arrived. Defaults
+    /// to [`HOOK_IDLE_GRACE_MS`].
+    hook_idle_grace_ms: u64,
 }
 
 impl Config {
-    /// Load configuration from the capsule's config store, falling back to defaults.
+    /// Load configuration from the capsule's config store, falling back to
+    /// defaults.
+    ///
+    /// Read per assemble invocation, **not** cached: `env::var` resolves the
+    /// per-invocation, per-principal env overlay, so a global cache would pin
+    /// one principal's tuning for every principal. The cost is a few host calls,
+    /// negligible against the hook fan-out they gate.
     fn load() -> Self {
-        let hook_timeout_ms = env::var("hook_timeout_ms")
-            .ok()
-            .and_then(|s| s.trim().trim_matches('"').parse::<u64>().ok())
-            .unwrap_or(DEFAULT_HOOK_POLL_TIMEOUT_MS);
-
-        Self { hook_timeout_ms }
+        Self {
+            hook_timeout_ms: env_u64("hook_timeout_ms", DEFAULT_HOOK_POLL_TIMEOUT_MS),
+            hook_first_response_ms: env_u64("hook_first_response_ms", HOOK_FIRST_RESPONSE_MS),
+            hook_idle_grace_ms: env_u64("hook_idle_grace_ms", HOOK_IDLE_GRACE_MS),
+        }
     }
+}
+
+/// Read a `u64` capsule config value from `env`, falling back to `default` when
+/// the key is missing or unparseable. Trims surrounding whitespace and quotes.
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.trim().trim_matches('"').parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Request from the react loop to assemble a prompt.
@@ -333,14 +356,22 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
             break;
         }
         let remaining = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
-        // Full remaining window while waiting for the FIRST response (the
-        // no-responder backstop); a short idle-grace once we have one, so
-        // the loop returns shortly after responders fall quiet instead of
-        // burning the whole window. See HOOK_IDLE_GRACE_MS.
+        // First-response window: wait up to `hook_first_response_ms` for the
+        // FIRST response, measured from the START of the loop (NOT reset each
+        // iteration), so a stream of non-matching messages cannot extend it
+        // past the cap; give up once it elapses with still no response (the
+        // no-responder backstop). Once we have one, switch to a short
+        // idle-grace so the loop returns shortly after responders fall quiet
+        // instead of burning the whole window.
         let timeout = if sourced_responses.is_empty() {
-            HOOK_FIRST_RESPONSE_MS.min(remaining)
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let first_remaining = config.hook_first_response_ms.saturating_sub(elapsed_ms);
+            if first_remaining == 0 {
+                break;
+            }
+            first_remaining.min(remaining)
         } else {
-            HOOK_IDLE_GRACE_MS.min(remaining)
+            config.hook_idle_grace_ms.min(remaining)
         };
 
         match sub.recv(timeout) {
