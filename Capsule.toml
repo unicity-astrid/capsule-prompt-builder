@@ -34,3 +34,8 @@ file = "astrid_capsule_prompt_builder.wasm"
 # subscribe grant the subscribe is CapabilityDenied and collect_tool_schemas()
 # returns empty. No handler — drained synchronously inside collect_tool_schemas.
 "tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+# Kernel broadcast after capsules (un)load. The run loop drains this to
+# invalidate the KV-cached tool schemas, so a freshly installed tool capsule's
+# tools reach the LLM on the next prompt instead of being masked by a stale
+# cache (which otherwise persists across daemon restarts).
+"astrid.v1.capsules_loaded" = { wit = "@unicity-astrid/wit/system/capsules-loaded" }
