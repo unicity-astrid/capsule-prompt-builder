@@ -523,6 +523,16 @@ fn fire_after_prompt_build(system_prompt: &str, user_context_prefix: &str, reque
 /// subsequent calls read directly from KV until invalidated.
 const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
 
+/// Invalidate the cached tool schemas in KV.
+///
+/// Called when the capsule set changes (`astrid.v1.capsules_loaded`) so the
+/// next `collect_tool_schemas()` re-runs the describe fan-out instead of
+/// serving a stale (KV-persisted, restart-surviving) list.
+fn invalidate_tool_cache() {
+    let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
+    log::info("Tool schema cache invalidated");
+}
+
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
 
@@ -775,6 +785,20 @@ impl PromptBuilder {
     #[astrid::interceptor("handle_assemble")]
     pub(crate) fn handle_assemble(&self, payload: serde_json::Value) -> Result<(), SysError> {
         assemble(&payload, &Config::load());
+        Ok(())
+    }
+
+    /// Invalidates the cached tool schemas when the capsule set changes.
+    ///
+    /// The kernel broadcasts `astrid.v1.capsules_loaded` after (un)loading
+    /// capsules. Under the pooled-interceptor model there is no run loop to
+    /// poll, so a dedicated interceptor drops `__tool_schema_cache` here — the
+    /// next `handle_assemble` re-collects a fresh tool set instead of serving a
+    /// stale (KV-persisted, restart-surviving) list, so newly installed tool
+    /// capsules reach the LLM on the next prompt without a manual cache clear.
+    #[astrid::interceptor("on_capsules_loaded")]
+    pub(crate) fn on_capsules_loaded(&self, _payload: serde_json::Value) -> Result<(), SysError> {
+        invalidate_tool_cache();
         Ok(())
     }
 }
