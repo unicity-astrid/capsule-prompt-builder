@@ -536,25 +536,136 @@ fn invalidate_tool_cache() {
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
 
-/// Timeout (ms) for fanning out the tool-describe request and collecting
-/// responses from every tool-providing capsule.
-const TOOL_DESCRIBE_FANOUT_TIMEOUT_MS: u64 = 2000;
+/// Installed-capsule manifests in the per-principal VFS. The number of these
+/// that subscribe to `tool.v1.request.describe` is the EXPECTED responder count
+/// the fan-out collects against (see `expected_tool_responder_count`). Same path
+/// the system capsule walks for `list_capsules`.
+const INSTALLED_CAPSULES_DIR: &str = "home://.local/capsules";
+
+/// Overall hard ceiling (ms) for the tool-describe fan-out: re-firing and
+/// collection stop once this elapses no matter what. A COMPLETE result is
+/// cached (`__tool_schema_cache`) so this cost is paid once; it is only reached
+/// when collection stays incomplete.
+const TOOL_DESCRIBE_FANOUT_TIMEOUT_MS: u64 = 5000;
+
+/// Per-round drain window (ms): after each (re)publish of the describe request,
+/// collect responses for this long before re-firing. A single fan-out publish
+/// reaches only a subset of responders (a kernel delivery race), so the request
+/// is re-fired and the union of distinct responders accumulated until the
+/// expected count has answered.
+const TOOL_DESCRIBE_ROUND_MS: u64 = 300;
+
+/// Fallback only. When the expected responder count cannot be derived from the
+/// installed manifests (capsule dir unreadable, or none found) the loop has no
+/// completion target, so it instead stops after this many consecutive rounds
+/// add no new responders.
+const TOOL_DESCRIBE_STABLE_ROUNDS: u32 = 3;
 
 /// Maximum number of tool-describe responses to collect before proceeding.
 const MAX_TOOL_DESCRIBE_RESPONSES: usize = 256;
 
+/// Does this capsule manifest declare a `[subscribe]` to the tool-describe
+/// request topic — i.e. is the capsule a tool-describe RESPONDER?
+///
+/// Section-aware on purpose. The fan-out REQUESTER (prompt-builder itself)
+/// declares `tool.v1.request.describe` under `[publish]`, so a plain substring
+/// match would miscount the requester as a responder. Only a `[subscribe]`
+/// entry makes a capsule answer the fan-out. Hand-rolled rather than pulling a
+/// TOML parser into the wasm guest: the manifests are our own well-formed TOML
+/// and we only need one table-membership test.
+fn manifest_subscribes_to_describe(manifest: &str) -> bool {
+    const TOPIC: &str = "tool.v1.request.describe";
+    let mut in_subscribe = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // A table header enters `[subscribe]`; any other header (including a
+        // `[subscribe.x]` subtable or a `[[array]]`) leaves it.
+        if line.starts_with('[') {
+            in_subscribe = line == "[subscribe]";
+            continue;
+        }
+        if in_subscribe
+            && let Some(key) = line.split('=').next()
+            && key.trim().trim_matches('"') == TOPIC
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Count installed capsules that are tool-describe responders, given each
+/// manifest's contents. Pure, so the fan-out completion target is unit-testable
+/// without the VFS.
+fn count_tool_responders<S: AsRef<str>>(manifests: &[S]) -> usize {
+    manifests
+        .iter()
+        .filter(|m| manifest_subscribes_to_describe(m.as_ref()))
+        .count()
+}
+
+/// Derive the EXPECTED number of tool-describe responders from the installed
+/// capsule manifests in the per-principal VFS.
+///
+/// Returns `None` when the count cannot be established — the capsule dir is
+/// unreadable, or no manifest subscribes to the describe topic. The caller then
+/// falls back to the quiet-rounds heuristic rather than treating "couldn't tell"
+/// (or a parse that found nothing) as an authoritative "no tools", which would
+/// otherwise let collection conclude — and cache — empty.
+fn expected_tool_responder_count() -> Option<usize> {
+    let entries = astrid_sdk::fs::read_dir(INSTALLED_CAPSULES_DIR).ok()?;
+    let mut manifests: Vec<String> = Vec::new();
+    for entry in entries {
+        let name = entry.file_name().to_string();
+        let path = format!("{INSTALLED_CAPSULES_DIR}/{name}/Capsule.toml");
+        if let Ok(content) = astrid_sdk::fs::read_to_string(&path) {
+            manifests.push(content);
+        }
+    }
+    let count = count_tool_responders(&manifests);
+    (count > 0).then_some(count)
+}
+
+/// Whether a finished collection should be written to the cache.
+///
+/// Cache ONLY a collection known to be complete: every expected responder
+/// answered (`expected == Some(n)` and `responders >= n`). An incomplete fan-out
+/// MUST NOT be cached — caching it would pin the partial tool set until the next
+/// `capsules_loaded` invalidation; leaving it uncached lets the next prompt
+/// retry. When the expected count is unknown (`None`) the heuristic path is
+/// best-effort: cache whatever non-empty set it gathered.
+fn should_cache_collection(expected: Option<usize>, responders: usize, tools: usize) -> bool {
+    if tools == 0 {
+        return false;
+    }
+    match expected {
+        Some(n) => responders >= n,
+        None => true,
+    }
+}
+
 /// Collect tool schemas from all capsules via IPC fan-out.
 ///
 /// Checks `__tool_schema_cache` in KV first. On cache miss, subscribes to
-/// `tool.v1.response.describe.*` and publishes a `tool.v1.request.describe`
-/// event. Tool-providing capsules respond on their own
-/// `tool.v1.response.describe.<source_id>` topic. Responses are collected
-/// within `TOOL_DESCRIBE_FANOUT_TIMEOUT_MS` and deduplicated by tool name.
+/// `tool.v1.response.describe.*` and (re)publishes `tool.v1.request.describe`.
+/// Tool-providing capsules respond on `tool.v1.response.describe.<source_id>`
+/// (the suffix is the literal `self`; the real responder id rides in the
+/// kernel-stamped `Message.source_id`). Responses are deduplicated by tool name.
 ///
-/// The pre-#752 implementation used `hooks::trigger`, which has been removed
-/// from the host ABI surface. This IPC-based fan-out replaces it; the same
-/// `{ "tools": [...] }` envelope (from SDK macro `tool_describe` and
-/// `astrid_bridge.mjs`) is honoured.
+/// A single fan-out publish reaches only a SUBSET of the tool responders (a
+/// kernel delivery race), so the request is re-fired and the union of distinct
+/// responders accumulated until every EXPECTED responder (derived from the
+/// installed manifests at load time, [`expected_tool_responder_count`]) has
+/// answered — or the overall ceiling elapses. Only a complete collection is
+/// cached (see [`should_cache_collection`]); an incomplete one is returned but
+/// left uncached so the next prompt retries and self-heals.
+///
+/// The pre-#752 implementation used `hooks::trigger`, removed from the host ABI;
+/// this IPC fan-out replaces it, honouring the same `{ "tools": [...] }`
+/// envelope (from SDK macro `tool_describe` and `astrid_bridge.mjs`).
 fn collect_tool_schemas() -> Vec<serde_json::Value> {
     // Check KV cache first.
     if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
@@ -563,6 +674,10 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         log::debug(format!("Returning {} cached tool schemas", cached.len()));
         return cached;
     }
+
+    // How many responders SHOULD answer, known from the installed manifests at
+    // load time. `None` => couldn't tell; fall back to the quiet-rounds heuristic.
+    let expected = expected_tool_responder_count();
 
     // Subscribe BEFORE publishing so we don't miss fast responders.
     let sub = match ipc::subscribe("tool.v1.response.describe.*") {
@@ -575,62 +690,91 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         }
     };
 
-    // Fire the fan-out request. Empty payload — every responder publishes its
-    // own tool schema set onto `tool.v1.response.describe.<source_id>`.
-    if let Err(e) = ipc::publish("tool.v1.request.describe", "{}") {
-        log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
-        return Vec::new();
-    }
-
-    // Collect responses until we time out or hit the cap. Monotonic
-    // clock via `astrid_sdk::time` — `std::time::Instant::now()`
-    // panics on `wasm32-unknown-unknown`.
+    // Collect across one or more fan-out rounds. Each round (re)publishes the
+    // request and drains responses for a short window; re-firing lets a
+    // responder that a previous fan-out missed answer a later one. Responders
+    // are deduped by `source_id`, tools by name. Termination: once every
+    // expected responder has answered we are complete and stop; without an
+    // expected count we stop after TOOL_DESCRIBE_STABLE_ROUNDS rounds add no new
+    // responders. Either way the overall ceiling bounds the wait. Monotonic
+    // clock via `astrid_sdk::time` — `std::time::Instant::now()` panics on
+    // `wasm32-unknown-unknown`.
     let mut all_tools: Vec<serde_json::Value> = Vec::new();
+    let mut seen_tools = std::collections::HashSet::<String>::new();
+    let mut responders = std::collections::HashSet::<String>::new();
     let start = astrid_sdk::time::monotonic();
-    let timeout_dur = std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
+    let overall = std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
+    let round_dur = std::time::Duration::from_millis(TOOL_DESCRIBE_ROUND_MS);
+    let mut quiet_rounds = 0u32;
 
-    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
+    while astrid_sdk::time::monotonic().saturating_sub(start) < overall
         && all_tools.len() < MAX_TOOL_DESCRIBE_RESPONSES
     {
-        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
-        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
-        if remaining_ms == 0 {
+        match expected {
+            // Complete: every expected responder has answered.
+            Some(n) if responders.len() >= n => break,
+            // No completion target — stop once responders go quiet.
+            None if quiet_rounds >= TOOL_DESCRIBE_STABLE_ROUNDS => break,
+            _ => {}
+        }
+
+        if let Err(e) = ipc::publish("tool.v1.request.describe", "{}") {
+            log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
             break;
         }
-        let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
 
-        match sub.recv(timeout) {
-            Ok(result) => {
-                if result.messages.is_empty() {
-                    break;
-                }
-                for msg in &result.messages {
-                    if let Some(tools) = extract_tools_from_response(&msg.payload) {
-                        all_tools.extend(tools);
+        let responders_before = responders.len();
+        let round_start = astrid_sdk::time::monotonic();
+        loop {
+            let in_round = astrid_sdk::time::monotonic().saturating_sub(round_start);
+            if in_round >= round_dur || all_tools.len() >= MAX_TOOL_DESCRIBE_RESPONSES {
+                break;
+            }
+            let remaining_ms = round_dur.saturating_sub(in_round).as_millis();
+            let remaining = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+            match sub.recv(remaining) {
+                Ok(result) if !result.messages.is_empty() => {
+                    for msg in &result.messages {
+                        if !msg.source_id.is_empty() {
+                            responders.insert(msg.source_id.clone());
+                        }
+                        if let Some(tools) = extract_tools_from_response(&msg.payload) {
+                            for tool in tools {
+                                match tool.get("name").and_then(|n| n.as_str()) {
+                                    Some(name) => {
+                                        if seen_tools.insert(name.to_string()) {
+                                            all_tools.push(tool);
+                                        }
+                                    }
+                                    None => all_tools.push(tool),
+                                }
+                            }
+                        }
                     }
                 }
+                // Round window elapsed (recv timeout) or an empty poll — this
+                // round is drained; re-fire on the next loop iteration.
+                _ => break,
             }
-            _ => break,
+        }
+
+        if responders.len() == responders_before {
+            quiet_rounds = quiet_rounds.saturating_add(1);
+        } else {
+            quiet_rounds = 0;
         }
     }
 
-    // Deduplicate by tool name (first occurrence wins).
-    let mut seen = std::collections::HashSet::new();
-    all_tools.retain(|tool| {
-        if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
-            seen.insert(name.to_string())
-        } else {
-            true
-        }
-    });
-
+    let cache = should_cache_collection(expected, responders.len(), all_tools.len());
     log::info(format!(
-        "Collected {} tool schemas via tool.v1.request.describe fan-out",
-        all_tools.len()
+        "Collected {} tool schemas from {} responder(s) (expected {}, cached={cache}) \
+         via tool.v1.request.describe fan-out",
+        all_tools.len(),
+        responders.len(),
+        expected.map_or_else(|| "?".to_string(), |n| n.to_string()),
     ));
 
-    // Cache the result for subsequent calls.
-    if let Err(e) = kv::set_json(TOOL_SCHEMA_CACHE_KEY, &all_tools) {
+    if cache && let Err(e) = kv::set_json(TOOL_SCHEMA_CACHE_KEY, &all_tools) {
         log::warn(format!("Failed to cache tool schemas in KV: {e}"));
     }
 

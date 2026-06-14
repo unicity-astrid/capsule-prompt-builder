@@ -10,6 +10,15 @@ id = "prompt-builder"
 file = "astrid_capsule_prompt_builder.wasm"
 type = "executable"
 
+# Read-only access to the installed-capsule manifest dir ONLY. collect_tool_schemas()
+# derives the EXPECTED tool-describe responder count by reading each
+# `home://.local/capsules/<name>/Capsule.toml` and counting those that subscribe
+# to `tool.v1.request.describe`, so the fan-out knows when it has heard from every
+# tool provider. Scoped to the capsules subtree (not `home://`) to keep
+# secrets/keys/audit/KV out of reach.
+[capabilities]
+fs_read = ["home://.local/capsules"]
+
 [publish]
 "prompt_builder.v1.response.*" = { wit = "@unicity-astrid/wit/prompt/assemble-response" }
 "prompt_builder.v1.hook.before_build" = { wit = "@unicity-astrid/wit/prompt/before-build-hook" }

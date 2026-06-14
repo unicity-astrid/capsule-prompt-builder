@@ -32,6 +32,14 @@ jobs:
       - name: Build WASM
         run: cargo build --locked --release --target wasm32-unknown-unknown
 
+      # Run the host-free unit tests on the native target. The capsule's default
+      # target is wasm (no test runner), and most of its tests call host fns that
+      # trap natively — so this runs only the `fanout_collection` module: the pure
+      # tool-describe responder-counting and cache-gating logic that guards
+      # fan-out collection determinism.
+      - name: Unit tests (fan-out collection logic)
+        run: cargo test --target "$(rustc -vV | sed -n 's/host: //p')" --lib -- tests::fanout_collection
+
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:

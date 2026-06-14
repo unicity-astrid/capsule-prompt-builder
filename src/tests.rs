@@ -621,3 +621,123 @@ fn parse_hook_responses_mixed_valid_and_invalid() {
         Some("Valid context")
     );
 }
+
+/// Tool-describe fan-out: expected-responder counting + cache gating.
+///
+/// Guards the determinism of the fan-out collection — a single publish reaches
+/// only a subset of tool capsules (a kernel delivery race), so collection
+/// re-fires until every EXPECTED responder (counted from the installed
+/// manifests) has answered, and an incomplete collection is never cached. The
+/// counting and cache-gate logic is pure and tested here; the IPC/VFS loop
+/// around it has no test double (the SDK provides none). Grouped in a sibling
+/// module so CI can run exactly these host-free tests on the native target
+/// (`cargo test --target <host> -- tests::fanout_collection`).
+mod fanout_collection {
+    use crate::{count_tool_responders, manifest_subscribes_to_describe, should_cache_collection};
+
+    /// A real tool-provider manifest declares the describe topic under `[subscribe]`.
+    const RESPONDER_MANIFEST: &str = r#"
+[package]
+name = "astrid-capsule-fs"
+
+[publish]
+"tool.v1.response.describe.*" = { wit = "@x/wit/tool/describe-response" }
+
+[subscribe]
+"tool.v1.execute.read_file" = { wit = "@x/wit/types/tool-call", handler = "read_file" }
+"tool.v1.request.describe" = { wit = "@x/wit/tool/describe-request", handler = "tool_describe" }
+"#;
+
+    /// The fan-out REQUESTER (prompt-builder) declares the SAME topic under
+    /// `[publish]` and must NOT be counted as a responder — the bug that made a
+    /// naive substring count one too high.
+    const REQUESTER_MANIFEST: &str = r#"
+[package]
+name = "astrid-capsule-prompt-builder"
+
+[publish]
+"tool.v1.request.describe" = { wit = "@x/wit/tool/describe-request" }
+
+[subscribe]
+"tool.v1.response.describe.*" = { wit = "@x/wit/tool/describe-response" }
+"prompt_builder.v1.assemble" = { wit = "@x/wit/prompt/assemble-request", handler = "handle_assemble" }
+"#;
+
+    /// A capsule that neither requests nor responds to the describe fan-out.
+    const UNRELATED_MANIFEST: &str = r#"
+[package]
+name = "astrid-capsule-session"
+
+[subscribe]
+"session.v1.request.get_messages" = { wit = "@x/wit/session/get-messages-request", handler = "get" }
+"#;
+
+    #[test]
+    fn responder_manifest_is_counted() {
+        assert!(manifest_subscribes_to_describe(RESPONDER_MANIFEST));
+    }
+
+    #[test]
+    fn requester_manifest_is_not_a_responder() {
+        // The topic appears only under `[publish]`, never `[subscribe]`.
+        assert!(!manifest_subscribes_to_describe(REQUESTER_MANIFEST));
+    }
+
+    #[test]
+    fn unrelated_manifest_is_not_a_responder() {
+        assert!(!manifest_subscribes_to_describe(UNRELATED_MANIFEST));
+    }
+
+    #[test]
+    fn subscribe_subtable_header_does_not_leak() {
+        // A `[subscribe.foo]` subtable must NOT keep us "in" `[subscribe]`, and a
+        // later `[publish]` of the topic must stay uncounted.
+        let manifest = r#"
+[subscribe.alias]
+note = "not the subscribe table"
+
+[publish]
+"tool.v1.request.describe" = { wit = "@x/wit/tool/describe-request" }
+"#;
+        assert!(!manifest_subscribes_to_describe(manifest));
+    }
+
+    #[test]
+    fn count_excludes_requester() {
+        let manifests = [RESPONDER_MANIFEST, REQUESTER_MANIFEST, UNRELATED_MANIFEST];
+        // Only the responder counts — NOT the requester (whose [publish] names
+        // the same topic) and NOT the unrelated capsule.
+        assert_eq!(count_tool_responders(&manifests), 1);
+    }
+
+    #[test]
+    fn count_empty_is_zero() {
+        let manifests: [&str; 0] = [];
+        assert_eq!(count_tool_responders(&manifests), 0);
+    }
+
+    #[test]
+    fn cache_only_when_every_expected_responder_answered() {
+        // Complete: all expected responders answered -> cache.
+        assert!(should_cache_collection(Some(6), 6, 21));
+        assert!(should_cache_collection(Some(6), 7, 21));
+        // Incomplete: fewer responders than expected -> do NOT cache, so the
+        // next prompt retries instead of pinning a partial tool set.
+        assert!(!should_cache_collection(Some(6), 5, 14));
+        assert!(!should_cache_collection(Some(6), 0, 0));
+    }
+
+    #[test]
+    fn cache_heuristic_path_when_expected_unknown() {
+        // No expected count (manifests unreadable): best-effort cache of a
+        // non-empty result, but never an empty one.
+        assert!(should_cache_collection(None, 3, 9));
+        assert!(!should_cache_collection(None, 0, 0));
+    }
+
+    #[test]
+    fn never_cache_an_empty_collection() {
+        assert!(!should_cache_collection(Some(6), 6, 0));
+        assert!(!should_cache_collection(None, 4, 0));
+    }
+}
