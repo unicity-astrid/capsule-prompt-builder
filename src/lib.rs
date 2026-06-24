@@ -25,6 +25,8 @@
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod tool_cache;
+
 /// Runtime configuration loaded from capsule config at startup.
 struct Config {
     /// Maximum time (in milliseconds) to wait for plugin hook responses — the
@@ -519,138 +521,8 @@ fn fire_after_prompt_build(system_prompt: &str, user_context_prefix: &str, reque
     let _ = ipc::publish_json("prompt_builder.v1.hook.after_build", &payload);
 }
 
-/// KV key for cached tool schemas. First call populates it via IPC broadcast;
-/// subsequent calls read directly from KV until invalidated.
-const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
-
-/// Invalidate the cached tool schemas in KV.
-///
-/// Called when the capsule set changes (`astrid.v1.capsules_loaded`) so the
-/// next `collect_tool_schemas()` re-runs the describe fan-out instead of
-/// serving a stale (KV-persisted, restart-surviving) list.
-fn invalidate_tool_cache() {
-    let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
-    log::info("Tool schema cache invalidated");
-}
-
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
-
-/// Timeout (ms) for fanning out the tool-describe request and collecting
-/// responses from every tool-providing capsule.
-const TOOL_DESCRIBE_FANOUT_TIMEOUT_MS: u64 = 2000;
-
-/// Maximum number of tool-describe responses to collect before proceeding.
-const MAX_TOOL_DESCRIBE_RESPONSES: usize = 256;
-
-/// Collect tool schemas from all capsules via IPC fan-out.
-///
-/// Checks `__tool_schema_cache` in KV first. On cache miss, subscribes to
-/// `tool.v1.response.describe.*` and publishes a `tool.v1.request.describe`
-/// event. Tool-providing capsules respond on their own
-/// `tool.v1.response.describe.<source_id>` topic. Responses are collected
-/// within `TOOL_DESCRIBE_FANOUT_TIMEOUT_MS` and deduplicated by tool name.
-///
-/// The pre-#752 implementation used `hooks::trigger`, which has been removed
-/// from the host ABI surface. This IPC-based fan-out replaces it; the same
-/// `{ "tools": [...] }` envelope (from SDK macro `tool_describe` and
-/// `astrid_bridge.mjs`) is honoured.
-fn collect_tool_schemas() -> Vec<serde_json::Value> {
-    // Check KV cache first.
-    if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
-        && !cached.is_empty()
-    {
-        log::debug(format!("Returning {} cached tool schemas", cached.len()));
-        return cached;
-    }
-
-    // Subscribe BEFORE publishing so we don't miss fast responders.
-    let sub = match ipc::subscribe("tool.v1.response.describe.*") {
-        Ok(s) => s,
-        Err(e) => {
-            log::error(format!(
-                "Failed to subscribe to tool.v1.response.describe.*: {e}"
-            ));
-            return Vec::new();
-        }
-    };
-
-    // Fire the fan-out request. Empty payload — every responder publishes its
-    // own tool schema set onto `tool.v1.response.describe.<source_id>`.
-    if let Err(e) = ipc::publish("tool.v1.request.describe", "{}") {
-        log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
-        return Vec::new();
-    }
-
-    // Collect responses until we time out or hit the cap. Monotonic
-    // clock via `astrid_sdk::time` — `std::time::Instant::now()`
-    // panics on `wasm32-unknown-unknown`.
-    let mut all_tools: Vec<serde_json::Value> = Vec::new();
-    let start = astrid_sdk::time::monotonic();
-    let timeout_dur = std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
-
-    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
-        && all_tools.len() < MAX_TOOL_DESCRIBE_RESPONSES
-    {
-        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
-        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
-        if remaining_ms == 0 {
-            break;
-        }
-        let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
-
-        match sub.recv(timeout) {
-            Ok(result) => {
-                if result.messages.is_empty() {
-                    break;
-                }
-                for msg in &result.messages {
-                    if let Some(tools) = extract_tools_from_response(&msg.payload) {
-                        all_tools.extend(tools);
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-
-    // Deduplicate by tool name (first occurrence wins).
-    let mut seen = std::collections::HashSet::new();
-    all_tools.retain(|tool| {
-        if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
-            seen.insert(name.to_string())
-        } else {
-            true
-        }
-    });
-
-    log::info(format!(
-        "Collected {} tool schemas via tool.v1.request.describe fan-out",
-        all_tools.len()
-    ));
-
-    // Cache the result for subsequent calls.
-    if let Err(e) = kv::set_json(TOOL_SCHEMA_CACHE_KEY, &all_tools) {
-        log::warn(format!("Failed to cache tool schemas in KV: {e}"));
-    }
-
-    all_tools
-}
-
-/// Extract the `tools` array from a `tool.v1.response.describe.*` payload.
-///
-/// Honours both the direct envelope (`{ "tools": [...] }`, emitted by the
-/// SDK macro `tool_describe` and `astrid_bridge.mjs`) and the wrapped
-/// `{ "data": { "tools": [...] } }` envelope used by some Custom payload
-/// publishers.
-fn extract_tools_from_response(payload: &str) -> Option<Vec<serde_json::Value>> {
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let tools = value
-        .get("tools")
-        .or_else(|| value.get("data").and_then(|d| d.get("tools")))
-        .and_then(|t| t.as_array())?;
-    Some(tools.clone())
-}
 
 /// Fetch session conversation history from the session capsule via IPC.
 ///
@@ -734,8 +606,8 @@ fn assemble(payload: &serde_json::Value, config: &Config) {
     // Merge all responses into the final prompt.
     let merged = merge_hook_responses(&request.system_prompt, &hook_responses);
 
-    // Collect tool schemas (cached after first call).
-    let tools = collect_tool_schemas();
+    // Collect tool schemas (cached per capsule-set epoch).
+    let tools = tool_cache::collect_tool_schemas();
 
     // Fetch session messages if a session_id was provided.
     let messages = request
@@ -785,20 +657,6 @@ impl PromptBuilder {
     #[astrid::interceptor("handle_assemble")]
     pub(crate) fn handle_assemble(&self, payload: serde_json::Value) -> Result<(), SysError> {
         assemble(&payload, &Config::load());
-        Ok(())
-    }
-
-    /// Invalidates the cached tool schemas when the capsule set changes.
-    ///
-    /// The kernel broadcasts `astrid.v1.capsules_loaded` after (un)loading
-    /// capsules. Under the pooled-interceptor model there is no run loop to
-    /// poll, so a dedicated interceptor drops `__tool_schema_cache` here — the
-    /// next `handle_assemble` re-collects a fresh tool set instead of serving a
-    /// stale (KV-persisted, restart-surviving) list, so newly installed tool
-    /// capsules reach the LLM on the next prompt without a manual cache clear.
-    #[astrid::interceptor("on_capsules_loaded")]
-    pub(crate) fn on_capsules_loaded(&self, _payload: serde_json::Value) -> Result<(), SysError> {
-        invalidate_tool_cache();
         Ok(())
     }
 }

@@ -39,10 +39,11 @@ type = "executable"
 # their descriptors on `tool.v1.response.describe.<source_id>`. Without this
 # subscribe grant the subscribe is CapabilityDenied and collect_tool_schemas()
 # returns empty. No handler — drained synchronously inside collect_tool_schemas.
+#
+# Cache invalidation is NOT via a capsule-set broadcast: the prompt builder
+# keys `__tool_schema_cache` on `astrid_sdk::runtime::capsule_set_epoch()` and
+# self-heals when the epoch moves. The former `astrid.v1.capsules_loaded`
+# interceptor carried no principal, so it only ever cleared the default
+# principal's cache — gateway-minted principals never saw runtime-installed
+# tools (astrid#982).
 "tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
-# Kernel broadcast after capsules (un)load, dispatched to `on_capsules_loaded`
-# as a pooled interceptor: it invalidates the KV-cached tool schemas so a
-# freshly installed tool capsule's tools reach the LLM on the next prompt
-# instead of being masked by a stale cache (which otherwise persists across
-# daemon restarts).
-"astrid.v1.capsules_loaded" = { wit = "@unicity-astrid/wit/system/capsules-loaded", handler = "on_capsules_loaded" }

@@ -621,3 +621,60 @@ fn parse_hook_responses_mixed_valid_and_invalid() {
         Some("Valid context")
     );
 }
+
+// ── Tool-cache epoch staleness (astrid#982 regression) ────────
+//
+// The cache must self-heal when the capsule-set epoch moves: a stale epoch
+// (the #982 failure — a runtime install the principal never saw invalidated)
+// and an empty list both read as a miss, forcing a fresh describe fan-out.
+
+fn cached_entry(epoch: u64, names: &[&str]) -> crate::tool_cache::CachedTools<serde_json::Value> {
+    crate::tool_cache::CachedTools {
+        epoch: astrid_sdk::runtime::CapsuleSetEpoch(epoch),
+        tools: names
+            .iter()
+            .map(|n| serde_json::json!({ "name": n }))
+            .collect(),
+    }
+}
+
+#[test]
+fn stale_epoch_is_not_served() {
+    // Cached under epoch 1, current epoch is 2 → the set changed → miss.
+    let cached = Some(cached_entry(1, &["read_file", "write_file"]));
+    let served =
+        crate::tool_cache::cached_tools_if_fresh(cached, astrid_sdk::runtime::CapsuleSetEpoch(2));
+    assert!(served.is_none());
+}
+
+#[test]
+fn fresh_epoch_is_served() {
+    // Cached under epoch 7, current epoch is 7 → hit, exact tool list returned.
+    let cached = Some(cached_entry(7, &["read_file", "write_file", "list_dir"]));
+    let served =
+        crate::tool_cache::cached_tools_if_fresh(cached, astrid_sdk::runtime::CapsuleSetEpoch(7))
+            .expect("fresh epoch should be served");
+    assert_eq!(served.len(), 3);
+    assert_eq!(served[0]["name"], "read_file");
+}
+
+#[test]
+fn empty_cache_is_a_miss_even_when_epoch_matches() {
+    // Epoch matches but the tool list is empty → miss, so a stored empty
+    // describe never starves the LLM of tools indefinitely.
+    let cached = Some(cached_entry(5, &[]));
+    let served =
+        crate::tool_cache::cached_tools_if_fresh(cached, astrid_sdk::runtime::CapsuleSetEpoch(5));
+    assert!(served.is_none());
+}
+
+#[test]
+fn absent_cache_is_a_miss() {
+    // No cache entry at all (e.g. older bare-`Vec` entry failed to
+    // deserialize) → miss, forcing a fresh describe.
+    let served = crate::tool_cache::cached_tools_if_fresh::<serde_json::Value>(
+        None,
+        astrid_sdk::runtime::CapsuleSetEpoch(3),
+    );
+    assert!(served.is_none());
+}
